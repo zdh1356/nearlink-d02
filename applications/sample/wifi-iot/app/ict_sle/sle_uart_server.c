@@ -1,7 +1,16 @@
 /**
- * SLE Audio Server
- * 接收 UART1 音频数据，通过 SLE 发送给 Client
- * 基于同学代码，只改动音频相关部分
+# Copyright (C) 2024 HiHope Open Source Organization .
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
  */
 
 #include "securec.h"
@@ -26,7 +35,6 @@
 #include "pinctrl.h"
 #include "uart.h"
 #include "errcode.h"
-#include <stdbool.h>
 
 #define OCTET_BIT_LEN 8
 #define UUID_LEN_2 2
@@ -34,245 +42,239 @@
 #define BT_INDEX_5 5
 #define BT_INDEX_4 4
 #define BT_INDEX_0 0
-
-#define SLE_MTU_SIZE_DEFAULT 1500
-#define UART_BUFF_LENGTH     1500
+#define SLE_MTU_SIZE_DEFAULT 1400
+/* 广播ID */
 #define SLE_ADV_HANDLE_DEFAULT 1
-
+/* sle server app uuid for test */
 static char g_sleUuidAppUuid[UUID_LEN_2] = {0x12, 0x34};
-static char g_slePropertyValue[OCTET_BIT_LEN] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+/* server notify property uuid for test */
+static char
+    g_slePropertyValue[OCTET_BIT_LEN] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+/* sle connect acb handle */
 static uint16_t g_sleConnHdl = 0;
+/* sle server handle */
 static uint8_t g_serverId = 0;
+/* sle service handle */
 static uint16_t g_serviceHandle = 0;
+/* sle ntf property handle */
 static uint16_t g_propertyHandle = 0;
+/* sle pair acb handle */
 uint16_t g_slePairHdl;
-static volatile bool g_connected = false;
-static volatile uint16_t g_ssap_mtu = SLE_MTU_SIZE_DEFAULT;
+/* 协商后的实际MTU大小 */
+static uint16_t g_negotiatedMtu = 0;
+
+/*
+ * SLE发送缓冲区与UART接收缓冲区
+ * 一帧音频最大 1032 字节，SLE notify 缓冲区需要 >= 1032
+ * UART接收缓冲区需要能容纳至少一帧完整数据
+ */
+#define UART_BUFF_LENGTH 1400
 uint8_t g_receiveBuf[UART_BUFF_LENGTH] = {0};
 
 #define UUID_16BIT_LEN 2
 #define UUID_128BIT_LEN 16
+#define printf(fmt, args...) printf(fmt, ##args)
 #define SLE_UART_SERVER_LOG "[sle uart server]"
 #define SLE_SERVER_INIT_DELAY_MS 1000
 #define DELAY_100MS 100
-#define TASK_SIZE 4096
+#define TASK_SIZE 2048
 #define PRIO 25
+#define USLEEP_1000000 1000000
+
+/*
+ * UART接收缓冲区大小：必须 >= 一帧音频大小(1032)
+ * 原值256太小，改为 1200
+ */
+#define SLE_UART_TRANSFER_SIZE 1200
 
 static uint8_t g_sleUartBase[] = {0x37, 0xBE, 0xA8, 0x80, 0xFC, 0x70, 0x11, 0xEA,
                                   0xB7, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
-/* ★★★ 音频 UART1 配置 ★★★ */
-#define AUDIO_UART_NUM      1
-#define AUDIO_UART_BAUD     921600
-#define AUDIO_UART_TX_PIN   15
-#define AUDIO_UART_RX_PIN   16
-#define AUDIO_UART_BUF_SIZE 2048
+static uint8_t g_appUartRxBuff[SLE_UART_TRANSFER_SIZE] = {0};
 
-static uint8_t g_audioUartRxBuff[AUDIO_UART_BUF_SIZE] = {0};
-static uart_buffer_config_t g_audio_uart_buffer_config = {
-    .rx_buffer = g_audioUartRxBuff,
-    .rx_buffer_size = AUDIO_UART_BUF_SIZE
-};
+static uart_buffer_config_t g_app_uart_buffer_config = {
+    .rx_buffer = g_appUartRxBuff,
+    .rx_buffer_size = SLE_UART_TRANSFER_SIZE};
 
-/* ★★★ UART 帧重组缓冲区 ★★★
- * ESP32 一次发 248 字节，但 UART idle 中断可能把一帧拆成多个回调
- * 所以需要在 Server 端做帧重组
+/* 发送统计 */
+static uint32_t g_sleSendCount = 0;
+
+/* ---------- UART 帧组装状态机 ----------
+ * ESP32 一次 write 1032字节，D02 串口可能因IDLE中断拆成多次回调，
+ * 所以必须在此按 0x55AA...0xAA55 协议组装完整帧再转发SLE。
  */
-#define AUDIO_FRAME_HEADER  0x55AA
-#define AUDIO_FRAME_TAIL    0xAA55
-#define AUDIO_FRAME_MAX_LEN 512  /* 包头2+seq2+len2+payload240+包尾2 = 248，留余量 */
+#define FRAME_BUF_SIZE (AUDIO_FRAME_MAX_SIZE + 16)  /* 留点余量 */
 
-static uint8_t  g_frame_buf[AUDIO_FRAME_MAX_LEN];
-static uint16_t g_frame_pos = 0;  /* 当前已收字节数 */
+typedef enum {
+    PARSE_WAIT_HEADER_LOW,   /* 等 0xAA */
+    PARSE_WAIT_HEADER_HIGH,  /* 等 0x55 */
+    PARSE_READ_SEQ_LOW,
+    PARSE_READ_SEQ_HIGH,
+    PARSE_READ_LEN_LOW,
+    PARSE_READ_LEN_HIGH,
+    PARSE_READ_PAYLOAD,
+    PARSE_WAIT_TAIL_LOW,     /* 等 0x55 */
+    PARSE_WAIT_TAIL_HIGH     /* 等 0xAA */
+} FrameParseState;
 
-/* ★★★ 统计变量 ★★★ */
-static uint32_t g_uart_rx_cb_count = 0;  /* UART 回调次数 */
-static uint32_t g_uart_rx_bytes = 0;     /* UART 总接收字节 */
-static uint32_t g_frame_ok_count = 0;    /* 成功重组帧数 */
-static uint32_t g_frame_bad_count = 0;   /* 丢弃帧数 */
-static uint32_t g_sle_tx_count = 0;      /* SLE 发送成功包数 */
-static uint32_t g_sle_tx_bytes = 0;      /* SLE 发送总字节 */
-static uint32_t g_sle_tx_fail = 0;       /* SLE 发送失败 */
+static uint8_t  g_frameBuf[FRAME_BUF_SIZE];
+static uint16_t g_frameIdx = 0;
+static uint16_t g_payloadLen = 0;
+static uint16_t g_payloadRecv = 0;
+static uint16_t g_frameSeq = 0;
+static FrameParseState g_parseState = PARSE_WAIT_HEADER_LOW;
 
-/* ★★★ 发送队列：UART 回调把帧放入队列，主线程取出来发 ★★★ */
-#define TX_QUEUE_SLOTS  8
-#define TX_FRAME_MAX    256
-
-static uint8_t  g_tx_slots[TX_QUEUE_SLOTS][TX_FRAME_MAX];
-static uint16_t g_tx_lens[TX_QUEUE_SLOTS];
-
-typedef struct {
-    uint8_t  idx;
-    uint16_t len;
-} tx_q_item_t;
-
-static uint8_t g_tx_widx = 0;
-static osMessageQueueId_t g_tx_queue = NULL;
-
-/* 前向声明 */
-errcode_t sle_uart_server_send_report_by_handle(const uint8_t *data, uint16_t len);
-
-/* ★★★ 处理一个完整的音频帧：直接通过 SLE 发送 ★★★ */
-static void process_audio_frame(const uint8_t *frame, uint16_t frame_len)
+/* 收到完整一帧后调用，通过SLE转发 */
+static void OnFrameComplete(void)
 {
-    if (!g_connected || g_propertyHandle == 0) {
-        return;
+    /*
+     * g_frameBuf 中已按协议存好完整帧:
+     *   [0..1] = 0x55AA
+     *   [2..3] = sequence
+     *   [4..5] = payload_len
+     *   [6 .. 6+payload_len-1] = audio data
+     *   [6+payload_len .. 6+payload_len+1] = 0xAA55
+     * 总长 = 6 + payload_len + 2 = payload_len + 8
+     */
+    uint16_t totalLen = g_payloadLen + AUDIO_FRAME_OVERHEAD;
+
+    g_sleSendCount++;
+    printf("%s [SLE TX] pkt #%u (esp_seq=%u), payload=%u, frame=%u bytes\r\n",
+           SLE_UART_SERVER_LOG, g_sleSendCount, g_frameSeq, g_payloadLen, totalLen);
+
+    /* 直接把完整帧（含包头包尾）通过SLE发出去 */
+    UartSleSendData(g_frameBuf, totalLen);
+}
+
+/* 逐字节喂入解析器 */
+static void FrameParseByte(uint8_t byte)
+{
+    switch (g_parseState) {
+        case PARSE_WAIT_HEADER_LOW:
+            /* 0x55AA 小端: 第一个字节是 0xAA */
+            if (byte == 0xAA) {
+                g_frameIdx = 0;
+                g_frameBuf[g_frameIdx++] = byte;
+                g_parseState = PARSE_WAIT_HEADER_HIGH;
+            }
+            break;
+
+        case PARSE_WAIT_HEADER_HIGH:
+            if (byte == 0x55) {
+                g_frameBuf[g_frameIdx++] = byte;
+                g_parseState = PARSE_READ_SEQ_LOW;
+            } else if (byte == 0xAA) {
+                /* 可能是新包头的低字节，保持 */
+                g_frameIdx = 0;
+                g_frameBuf[g_frameIdx++] = byte;
+            } else {
+                g_parseState = PARSE_WAIT_HEADER_LOW;
+            }
+            break;
+
+        case PARSE_READ_SEQ_LOW:
+            g_frameBuf[g_frameIdx++] = byte;
+            g_frameSeq = byte;
+            g_parseState = PARSE_READ_SEQ_HIGH;
+            break;
+
+        case PARSE_READ_SEQ_HIGH:
+            g_frameBuf[g_frameIdx++] = byte;
+            g_frameSeq |= ((uint16_t)byte << 8);
+            g_parseState = PARSE_READ_LEN_LOW;
+            break;
+
+        case PARSE_READ_LEN_LOW:
+            g_frameBuf[g_frameIdx++] = byte;
+            g_payloadLen = byte;
+            g_parseState = PARSE_READ_LEN_HIGH;
+            break;
+
+        case PARSE_READ_LEN_HIGH:
+            g_frameBuf[g_frameIdx++] = byte;
+            g_payloadLen |= ((uint16_t)byte << 8);
+            g_payloadRecv = 0;
+            /* 安全检查 */
+            if (g_payloadLen > AUDIO_CHUNK_SAMPLES * 2 || g_payloadLen == 0) {
+                printf("%s [PARSE] bad payload_len=%u, reset\r\n", SLE_UART_SERVER_LOG, g_payloadLen);
+                g_parseState = PARSE_WAIT_HEADER_LOW;
+            } else {
+                g_parseState = PARSE_READ_PAYLOAD;
+            }
+            break;
+
+        case PARSE_READ_PAYLOAD:
+            if (g_frameIdx < FRAME_BUF_SIZE) {
+                g_frameBuf[g_frameIdx++] = byte;
+            }
+            g_payloadRecv++;
+            if (g_payloadRecv >= g_payloadLen) {
+                g_parseState = PARSE_WAIT_TAIL_LOW;
+            }
+            break;
+
+        case PARSE_WAIT_TAIL_LOW:
+            /* 0xAA55 小端: 第一个字节 0x55 */
+            g_frameBuf[g_frameIdx++] = byte;
+            if (byte == 0x55) {
+                g_parseState = PARSE_WAIT_TAIL_HIGH;
+            } else {
+                printf("%s [PARSE] bad tail low=0x%02x, reset\r\n", SLE_UART_SERVER_LOG, byte);
+                g_parseState = PARSE_WAIT_HEADER_LOW;
+            }
+            break;
+
+        case PARSE_WAIT_TAIL_HIGH:
+            g_frameBuf[g_frameIdx++] = byte;
+            if (byte == 0xAA) {
+                /* ★ 完整帧收到 */
+                OnFrameComplete();
+            } else {
+                printf("%s [PARSE] bad tail high=0x%02x, reset\r\n", SLE_UART_SERVER_LOG, byte);
+            }
+            g_parseState = PARSE_WAIT_HEADER_LOW;
+            break;
+
+        default:
+            g_parseState = PARSE_WAIT_HEADER_LOW;
+            break;
     }
+}
 
-    if (g_tx_queue == NULL) {
-        return;
-    }
-    if (frame_len > TX_FRAME_MAX) {
-        return;
-    }
-
-    uint8_t idx = g_tx_widx;
-    g_tx_widx = (uint8_t)((g_tx_widx + 1) % TX_QUEUE_SLOTS);
-
-    (void)memcpy_s(g_tx_slots[idx], TX_FRAME_MAX, frame, frame_len);
-    g_tx_lens[idx] = frame_len;
-
-    tx_q_item_t item;
-    item.idx = idx;
-    item.len = frame_len;
-
-    if (osMessageQueuePut(g_tx_queue, &item, 0, 0) != osOK) {
-        /* 队列满，丢最新的一包 */
-        g_sle_tx_fail++;
-        if (g_sle_tx_fail <= 10 || (g_sle_tx_fail % 100) == 0) {
-            osal_printk("%s TX queue full[%u]\r\n", SLE_UART_SERVER_LOG, (unsigned)g_sle_tx_fail);
+static void server_uart_rx_callback(const void *buffer, uint16_t length, bool error)
+{
+    if (length > 0) {
+        printf("%s [UART1 RX] recv %d bytes\r\n", SLE_UART_SERVER_LOG, length);
+        const uint8_t *data = (const uint8_t *)buffer;
+        for (uint16_t i = 0; i < length; i++) {
+            FrameParseByte(data[i]);
         }
     }
 }
 
-/* ★★★ 在 UART RX 回调中做帧重组 ★★★
- * 协议格式: [0x55AA(2)] [seq(2)] [payload_len(2)] [payload(N)] [0xAA55(2)]
- * 总帧长 = 2 + 2 + 2 + payload_len + 2 = payload_len + 8
- */
-static void audio_uart_rx_callback(const void *buffer, uint16_t length, bool error)
-{
-    if (error || length == 0) {
-        return;
-    }
-
-    g_uart_rx_cb_count++;
-    g_uart_rx_bytes += length;
-
-    const uint8_t *data = (const uint8_t *)buffer;
-
-    for (uint16_t i = 0; i < length; i++) {
-        g_frame_buf[g_frame_pos++] = data[i];
-
-        /* 防溢出 */
-        if (g_frame_pos >= AUDIO_FRAME_MAX_LEN) {
-            g_frame_pos = 0;
-            g_frame_bad_count++;
-            continue;
-        }
-
-        /* 至少收到 6 字节才能解析 payload_len */
-        if (g_frame_pos >= 6) {
-            uint16_t hdr = (uint16_t)(g_frame_buf[0] | (g_frame_buf[1] << 8));
-
-            /* 检查包头 */
-            if (hdr != AUDIO_FRAME_HEADER) {
-                /* 包头不对，尝试找到下一个 0xAA 重新同步 */
-                uint16_t shift = 1;
-                while (shift < g_frame_pos && g_frame_buf[shift] != 0xAA) {
-                    shift++;
-                }
-                if (shift < g_frame_pos) {
-                    uint16_t remain = g_frame_pos - shift;
-                    (void)memmove(g_frame_buf, g_frame_buf + shift, remain);
-                    g_frame_pos = remain;
-                } else {
-                    g_frame_pos = 0;
-                }
-                g_frame_bad_count++;
-                continue;
-            }
-
-            /* 解析 payload_len (第4-5字节，小端) */
-            uint16_t payload_len = (uint16_t)(g_frame_buf[4] | (g_frame_buf[5] << 8));
-            uint16_t expected_frame_len = payload_len + 8; /* 包头2+seq2+len2+payload+包尾2 */
-
-            if (payload_len == 0 || payload_len > 480 || expected_frame_len > AUDIO_FRAME_MAX_LEN) {
-                /* payload_len 非法，丢弃第一个字节重新同步 */
-                uint16_t remain = g_frame_pos - 1;
-                (void)memmove(g_frame_buf, g_frame_buf + 1, remain);
-                g_frame_pos = remain;
-                g_frame_bad_count++;
-                continue;
-            }
-
-            /* 检查是否收够一整帧 */
-            if (g_frame_pos >= expected_frame_len) {
-                /* 检查包尾 */
-                uint16_t tail_off = expected_frame_len - 2;
-                uint16_t tail = (uint16_t)(g_frame_buf[tail_off] | (g_frame_buf[tail_off + 1] << 8));
-
-                if (tail == AUDIO_FRAME_TAIL) {
-                    /* ★ 完整帧！发送 */
-                    g_frame_ok_count++;
-                    process_audio_frame(g_frame_buf, expected_frame_len);
-
-                    if ((g_frame_ok_count % 200) == 0) {
-                        osal_printk("%s FRAME: ok=%u bad=%u uart_cb=%u\r\n",
-                                    SLE_UART_SERVER_LOG,
-                                    (unsigned)g_frame_ok_count, (unsigned)g_frame_bad_count,
-                                    (unsigned)g_uart_rx_cb_count);
-                    }
-                } else {
-                    g_frame_bad_count++;
-                }
-
-                /* 移除已处理的帧，保留剩余数据 */
-                uint16_t consumed = expected_frame_len;
-                uint16_t remain = g_frame_pos - consumed;
-                if (remain > 0) {
-                    (void)memmove(g_frame_buf, g_frame_buf + consumed, remain);
-                }
-                g_frame_pos = remain;
-            }
-        }
-    }
-}
-
-/* ★★★ 音频 UART1 初始化 ★★★ */
-static void AudioUartInit(void)
+static void UartInitConfig(void)
 {
     uart_attr_t attr = {
-        .baud_rate = AUDIO_UART_BAUD,
+        .baud_rate = 921600,
         .data_bits = UART_DATA_BIT_8,
         .stop_bits = UART_STOP_BIT_1,
-        .parity = UART_PARITY_NONE
-    };
-    uart_pin_config_t pin_config = {
-        .tx_pin = AUDIO_UART_TX_PIN,
-        .rx_pin = AUDIO_UART_RX_PIN,
-        .cts_pin = PIN_NONE,
-        .rts_pin = PIN_NONE
-    };
+        .parity = UART_PARITY_NONE};
 
-    uapi_uart_deinit(AUDIO_UART_NUM);
-    errcode_t ret = uapi_uart_init(AUDIO_UART_NUM, &pin_config, &attr, NULL, &g_audio_uart_buffer_config);
-    if (ret != ERRCODE_SUCC) {
-        osal_printk("%s UART%d init fail: %x\r\n", SLE_UART_SERVER_LOG, AUDIO_UART_NUM, ret);
-        return;
-    }
-    ret = uapi_uart_register_rx_callback(AUDIO_UART_NUM, UART_RX_CONDITION_FULL_OR_IDLE,
-                                         1, audio_uart_rx_callback);
-    if (ret != ERRCODE_SUCC) {
-        osal_printk("%s UART%d callback fail: %x\r\n", SLE_UART_SERVER_LOG, AUDIO_UART_NUM, ret);
-        return;
-    }
-    osal_printk("%s UART%d ok @ %d, TX=%d RX=%d\r\n",
-                SLE_UART_SERVER_LOG, AUDIO_UART_NUM, AUDIO_UART_BAUD,
-                AUDIO_UART_TX_PIN, AUDIO_UART_RX_PIN);
+    uart_pin_config_t pin_config = {
+        .tx_pin = 15,
+        .rx_pin = 16,
+        .cts_pin = PIN_NONE,
+        .rts_pin = PIN_NONE};
+    uapi_uart_deinit(1);
+    uapi_uart_init(1, &pin_config, &attr, NULL, &g_app_uart_buffer_config);
+    (void)uapi_uart_register_rx_callback(1,
+                                         UART_RX_CONDITION_FULL_OR_IDLE,
+                                         1,
+                                         server_uart_rx_callback);
 }
 
-/* ========== UUID 工具函数（完全不动） ========== */
-static void Encode2byteLittle(uint8_t *ptr, uint16_t data)
+static void Encode2byteLittle(
+    uint8_t *ptr, uint16_t data)
 {
     *(uint8_t *)((ptr) + 1) = (uint8_t)((data) >> 0x8);
     *(uint8_t *)(ptr) = (uint8_t)(data);
@@ -283,7 +285,7 @@ static void sle_uuid_set_base(SleUuid *out)
     errcode_t ret;
     ret = memcpy_s(out->uuid, SLE_UUID_LEN, g_sleUartBase, SLE_UUID_LEN);
     if (ret != EOK) {
-        osal_printk("%s sle_uuid_set_base memcpy fail\n", SLE_UART_SERVER_LOG);
+        printf("%s sle_uuid_set_base memcpy fail\n", SLE_UART_SERVER_LOG);
         out->len = 0;
         return;
     }
@@ -300,32 +302,33 @@ static void sle_uuid_setu2(uint16_t u2, SleUuid *out)
 static void sle_uart_uuid_print(SleUuid *uuid)
 {
     if (uuid == NULL) {
-        osal_printk("%suuid_print, uuid is null\r\n", SLE_UART_SERVER_LOG);
+        printf("%suuid_print, uuid is null\r\n", SLE_UART_SERVER_LOG);
         return;
     }
+
     if (uuid->len == UUID_16BIT_LEN) {
-        osal_printk("%s uuid: %02x %02x.\n", SLE_UART_SERVER_LOG,
+        printf("%s uuid: %02x %02x.\n", SLE_UART_SERVER_LOG,
                uuid->uuid[14], uuid->uuid[15]);
     } else if (uuid->len == UUID_128BIT_LEN) {
-        osal_printk("%s uuid: \n", SLE_UART_SERVER_LOG);
-        osal_printk("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG,
-               uuid->uuid[0], uuid->uuid[1], uuid->uuid[2], uuid->uuid[3]);
-        osal_printk("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG,
-               uuid->uuid[4], uuid->uuid[5], uuid->uuid[6], uuid->uuid[7]);
-        osal_printk("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG,
-               uuid->uuid[8], uuid->uuid[9], uuid->uuid[10], uuid->uuid[11]);
-        osal_printk("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG,
-               uuid->uuid[12], uuid->uuid[13], uuid->uuid[14], uuid->uuid[15]);
+        printf("%s uuid: \n", SLE_UART_SERVER_LOG);
+        printf("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG, uuid->uuid[0], uuid->uuid[1],
+               uuid->uuid[2], uuid->uuid[3]);
+        printf("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG, uuid->uuid[4], uuid->uuid[5],
+               uuid->uuid[6], uuid->uuid[7]);
+        printf("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG, uuid->uuid[8], uuid->uuid[9],
+               uuid->uuid[10], uuid->uuid[11]);
+        printf("%s 0x%02x 0x%02x 0x%02x 0x%02x\n", SLE_UART_SERVER_LOG, uuid->uuid[12], uuid->uuid[13],
+               uuid->uuid[14], uuid->uuid[15]);
     }
 }
 
-/* ========== SSAP 回调（完全不动） ========== */
 static void ssaps_mtu_changed_cbk(uint8_t serverId, uint16_t connId, SsapcExchangeInfo *mtu_size,
                                   errcode_t status)
 {
-    osal_printk("%s mtu_changed server_id:%x, conn_id:%x, mtu_size:%x, status:%x\r\n",
+    printf("%s ssaps_mtu_changed_cbk server_id:%x, conn_id:%x, mtu_size:%x, status:%x\r\n",
            SLE_UART_SERVER_LOG, serverId, connId, mtu_size->mtuSize, status);
-    g_ssap_mtu = mtu_size->mtuSize;
+    g_negotiatedMtu = mtu_size->mtuSize;
+    printf("%s [MTU] negotiated MTU = %u\r\n", SLE_UART_SERVER_LOG, g_negotiatedMtu);
     if (g_slePairHdl == 0) {
         g_slePairHdl = connId + 1;
     }
@@ -333,43 +336,39 @@ static void ssaps_mtu_changed_cbk(uint8_t serverId, uint16_t connId, SsapcExchan
 
 static void ssaps_start_service_cbk(uint8_t serverId, uint16_t handle, errcode_t status)
 {
-    osal_printk("%s start service cbk server_id:%d, handle:%x, status:%x\r\n",
-           SLE_UART_SERVER_LOG, serverId, handle, status);
+    printf("%s start service cbk server_id:%d, handle:%x, status:%x\r\n", SLE_UART_SERVER_LOG,
+           serverId, handle, status);
 }
-
 static void ssaps_add_service_cbk(uint8_t serverId, SleUuid *uuid, uint16_t handle, errcode_t status)
 {
-    osal_printk("%s add service cbk server_id:%x, handle:%x, status:%x\r\n",
-           SLE_UART_SERVER_LOG, serverId, handle, status);
+    printf("%s add service cbk server_id:%x, handle:%x, status:%x\r\n", SLE_UART_SERVER_LOG,
+           serverId, handle, status);
     sle_uart_uuid_print(uuid);
 }
-
 static void ssaps_add_property_cbk(uint8_t serverId, SleUuid *uuid, uint16_t serviceHandle,
                                    uint16_t handle, errcode_t status)
 {
-    osal_printk("%s add property cbk server_id:%x, service_handle:%x, handle:%x, status:%x\r\n",
+    printf("%s add property cbk server_id:%x, service_handle:%x, handle:%x, status:%x\r\n",
            SLE_UART_SERVER_LOG, serverId, serviceHandle, handle, status);
     sle_uart_uuid_print(uuid);
 }
-
 static void ssaps_add_descriptor_cbk(uint8_t serverId, SleUuid *uuid, uint16_t serviceHandle,
                                      uint16_t propertyHandle, errcode_t status)
 {
-    osal_printk("%s add descriptor cbk server_id:%x, service_handle:%x, property_handle:%x, status:%x\r\n",
+    printf("%s add descriptor cbk server_id:%x, service_handle:%x, property_handle:%x, status:%x\r\n",
            SLE_UART_SERVER_LOG, serverId, serviceHandle, propertyHandle, status);
     sle_uart_uuid_print(uuid);
 }
-
 static void ssaps_delete_all_service_cbk(uint8_t serverId, errcode_t status)
 {
-    osal_printk("%s delete all service server_id:%x, status:%x\r\n",
-           SLE_UART_SERVER_LOG, serverId, status);
+    printf("%s delete all service server_id:%x, status:%x\r\n", SLE_UART_SERVER_LOG,
+           serverId, status);
 }
 
-static errcode_t sle_ssaps_register_cbks(ssaps_read_request_callback ssaps_read_callback,
-                                         ssaps_write_request_callback ssaps_write_callback)
+static errcode_t sle_ssaps_register_cbks(SsapsReadRequestCallback ssaps_read_callback,
+                                         SsapsWriteRequestCallback ssaps_write_callback)
 {
-
+    ssap_exchange_info_t info = {0};
     errcode_t ret;
     SsapsCallbacks ssaps_cbk = {0};
     ssaps_cbk.addServiceCb = ssaps_add_service_cbk;
@@ -377,19 +376,21 @@ static errcode_t sle_ssaps_register_cbks(ssaps_read_request_callback ssaps_read_
     ssaps_cbk.addDescriptorCb = ssaps_add_descriptor_cbk;
     ssaps_cbk.startServiceCb = ssaps_start_service_cbk;
     ssaps_cbk.deleteAllServiceCb = ssaps_delete_all_service_cbk;
-
+    
+    info.mtu_size = SLE_MTU_SIZE_DEFAULT;
+    info.version = 1;
+    
     ssaps_cbk.mtuChangedCb = ssaps_mtu_changed_cbk;
-    ssaps_cbk.readRequestCb = (SsapsReadRequestCallback)ssaps_read_callback;
-    ssaps_cbk.writeRequestCb = (SsapsWriteRequestCallback)ssaps_write_callback;
+    ssaps_cbk.readRequestCb = ssaps_read_callback;
+    ssaps_cbk.writeRequestCb = ssaps_write_callback;
     ret = SsapsRegisterCallbacks(&ssaps_cbk);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s ssaps_register_callbacks fail:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s ssaps_register_callbacks fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
         return ret;
     }
     return ERRCODE_SLE_SUCCESS;
 }
 
-/* ========== 添加服务（完全不动） ========== */
 static errcode_t sle_uuid_server_service_add(void)
 {
     errcode_t ret;
@@ -397,7 +398,7 @@ static errcode_t sle_uuid_server_service_add(void)
     sle_uuid_setu2(SLE_UUID_SERVER_SERVICE, &service_uuid);
     ret = SsapsAddServiceSync(g_serverId, &service_uuid, 1, &g_serviceHandle);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s add service fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s sle uuid add service fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
         return ERRCODE_SLE_FAIL;
     }
     return ERRCODE_SLE_SUCCESS;
@@ -422,7 +423,7 @@ static errcode_t add_property_sync(void)
     }
     ret = SsapsAddPropertySync(g_serverId, g_serviceHandle, &property, &g_propertyHandle);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s add property fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s sle uart add property fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
         osal_vfree(property.value);
         return ERRCODE_SLE_FAIL;
     }
@@ -449,7 +450,7 @@ static errcode_t sle_uuid_server_property_add(void)
     }
     ret = SsapsAddDescriptorSync(g_serverId, g_serviceHandle, g_propertyHandle, &descriptor);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s add descriptor fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s sle uart add descriptor fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
         osal_vfree(descriptor.value);
         return ERRCODE_SLE_FAIL;
     }
@@ -461,7 +462,7 @@ static errcode_t sle_uart_server_add(void)
 {
     errcode_t ret;
     SleUuid app_uuid = {0};
-    osal_printk("%s sle uart add service in\r\n", SLE_UART_SERVER_LOG);
+    printf("%s sle uart add service in\r\n", SLE_UART_SERVER_LOG);
     app_uuid.len = sizeof(g_sleUuidAppUuid);
     if (memcpy_s(app_uuid.uuid, app_uuid.len, g_sleUuidAppUuid, sizeof(g_sleUuidAppUuid)) != EOK) {
         return ERRCODE_SLE_FAIL;
@@ -475,85 +476,64 @@ static errcode_t sle_uart_server_add(void)
         SsapsUnregisterServer(g_serverId);
         return ERRCODE_SLE_FAIL;
     }
-    osal_printk("%s add service ok, server_id:%x, service_handle:%x, property_handle:%x\r\n",
+    printf("%s sle uart add service, server_id:%x, service_handle:%x, property_handle:%x\r\n",
            SLE_UART_SERVER_LOG, g_serverId, g_serviceHandle, g_propertyHandle);
     ret = SsapsStartService(g_serverId, g_serviceHandle);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s start service fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s sle uart add service fail, ret:%x\r\n", SLE_UART_SERVER_LOG, ret);
         return ERRCODE_SLE_FAIL;
     }
-    osal_printk("%s sle uart add service out\r\n", SLE_UART_SERVER_LOG);
+    printf("%s sle uart add service out\r\n", SLE_UART_SERVER_LOG);
     return ERRCODE_SLE_SUCCESS;
 }
 
-/* ========== SLE 发送 ========== */
+/* 通过handle向client发送数据（支持>255字节） */
 errcode_t sle_uart_server_send_report_by_handle(const uint8_t *data, uint16_t len)
 {
     SsapsNtfInd param = {0};
-    uint16_t handle = g_propertyHandle;
-    uint16_t conn = g_sleConnHdl;
-    uint8_t  sid = g_serverId;
 
-    if (!g_connected || handle == 0) {
-        return ERRCODE_FAIL;
-    }
-    if (data == NULL || len == 0 || len > UART_BUFF_LENGTH) {
-        return ERRCODE_FAIL;
-    }
-
-    param.handle = handle;
+    param.handle = g_propertyHandle;
     param.type = SSAP_PROPERTY_TYPE_VALUE;
     param.value = g_receiveBuf;
     param.valueLen = len;
-
     if (memcpy_s(param.value, UART_BUFF_LENGTH, data, len) != EOK) {
-        return ERRCODE_FAIL;
+        return ERRCODE_SLE_FAIL;
     }
-    return SsapsNotifyIndicate(sid, conn, &param);
+    return SsapsNotifyIndicate(g_serverId, g_sleConnHdl, &param);
 }
 
-/* ========== 连接回调 ========== */
-static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr,
-    SleAcbStateType conn_state, SlePairStateType pair_state, SleDiscReasonType disc_reason)
+static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, SleAcbStateType conn_state,
+                                          SlePairStateType pair_state, SleDiscReasonType disc_reason)
 {
-    osal_printk("%s conn_state changed conn_id:0x%02x, state:0x%x, pair:0x%x, reason:0x%x\r\n",
+    printf("%s connect state changed conn_id:0x%02x, conn_state:0x%x, pair_state:0x%x, disc_reason:0x%x\r\n",
            SLE_UART_SERVER_LOG, connId, conn_state, pair_state, disc_reason);
-    osal_printk("%s addr:%02x:**:**:**:%02x:%02x\r\n", SLE_UART_SERVER_LOG,
+    printf("%s addr:%02x:**:**:**:%02x:%02x\r\n", SLE_UART_SERVER_LOG,
            addr->addr[BT_INDEX_0], addr->addr[BT_INDEX_4], addr->addr[BT_INDEX_5]);
     if (conn_state == OH_SLE_ACB_STATE_CONNECTED) {
-        g_connected = true;
         g_sleConnHdl = connId;
+        g_sleSendCount = 0;
         ssap_exchange_info_t parameter = {0};
         parameter.mtu_size = SLE_MTU_SIZE_DEFAULT;
         parameter.version = 1;
         ssaps_set_info(g_serverId, &parameter);
-        osal_printk("%s Connected! MTU set to %u\r\n", SLE_UART_SERVER_LOG, SLE_MTU_SIZE_DEFAULT);
-        /* 统计清零 */
-        g_uart_rx_cb_count = 0;
-        g_uart_rx_bytes = 0;
-        g_frame_ok_count = 0;
-        g_frame_bad_count = 0;
-        g_sle_tx_count = 0;
-        g_sle_tx_bytes = 0;
-        g_sle_tx_fail = 0;
-        g_frame_pos = 0;
+        printf("%s [MTU] requesting MTU = %d\r\n", SLE_UART_SERVER_LOG, SLE_MTU_SIZE_DEFAULT);
     } else if (conn_state == OH_SLE_ACB_STATE_DISCONNECTED) {
-        g_connected = false;
+        printf("%s [STATS] total SLE packets sent = %u\r\n", SLE_UART_SERVER_LOG, g_sleSendCount);
         g_sleConnHdl = 0;
         g_slePairHdl = 0;
-        osal_printk("%s Disconnected. STAT: frame_ok=%u bad=%u sle_tx=%u fail=%u\r\n",
-                    SLE_UART_SERVER_LOG,
-                    (unsigned)g_frame_ok_count, (unsigned)g_frame_bad_count,
-                    (unsigned)g_sle_tx_count, (unsigned)g_sle_tx_fail);
+        g_negotiatedMtu = 0;
+        /* 重置帧解析状态 */
+        g_parseState = PARSE_WAIT_HEADER_LOW;
         SleStartAnnounce(SLE_ADV_HANDLE_DEFAULT);
     }
 }
 
 static void sle_pair_complete_cbk(uint16_t connId, const SleAddr *addr, errcode_t status)
 {
-    (void)addr;
-    osal_printk("%s pair complete conn_id:%02x, status:%x\r\n",
-           SLE_UART_SERVER_LOG, connId, status);
+    printf("%s pair complete conn_id:%02x, status:%x\r\n", SLE_UART_SERVER_LOG,
+           connId, status);
+    printf("%s pair complete addr: %02x:**:**:**: %02x: %02x\r\n", SLE_UART_SERVER_LOG,
+           addr->addr[BT_INDEX_0], addr->addr[BT_INDEX_4], addr->addr[BT_INDEX_5]);
     g_slePairHdl = connId + 1;
 }
 
@@ -565,60 +545,55 @@ static errcode_t sle_conn_register_cbks(void)
     conn_cbks.pairCompleteCb = sle_pair_complete_cbk;
     ret = SleConnectionRegisterCallbacks(&conn_cbks);
     if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s conn_register_cbks fail:%x\r\n", SLE_UART_SERVER_LOG, ret);
+        printf("%s sle_connection_register_callbacks fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
         return ret;
     }
     return ERRCODE_SLE_SUCCESS;
 }
 
-/* ========== SSAP read/write 回调 ========== */
-void ssaps_read_request_callbacks(uint8_t serverId, uint16_t connId,
-                                  ssaps_req_read_cb_t *read_cb_para, errcode_t status)
+void ssaps_read_request_callbacks(uint8_t serverId,
+                                  uint16_t connId, ssaps_req_read_cb_t *read_cb_para, errcode_t status)
 {
-    (void)serverId; (void)connId; (void)read_cb_para; (void)status;
+    (void)serverId;
+    (void)connId;
+    (void)read_cb_para;
+    (void)status;
 }
 
 void ssaps_write_request_callbacks(uint8_t serverId, uint16_t connId,
                                    ssaps_req_write_cb_t *write_cb_para, errcode_t status)
 {
-    (void)serverId; (void)connId; (void)status;
-    if (write_cb_para != NULL && write_cb_para->length > 0) {
-        write_cb_para->value[write_cb_para->length - 1] = '\0';
-        osal_printk(" client_send_data: %s\r\n", write_cb_para->value);
-    }
+    (void)serverId;
+    (void)connId;
+    (void)status;
+    printf("%s [SLE RX] recv %d bytes from client\r\n", SLE_UART_SERVER_LOG, write_cb_para->length);
 }
 
-/* ========== bridge API ========== */
-bool sle_uart_server_is_ready(void)
-{
-    return (g_connected && (g_propertyHandle != 0));
-}
-
-uint16_t sle_uart_server_get_mtu(void)
-{
-    return g_ssap_mtu;
-}
-
-errcode_t sle_uart_server_send_bytes(const uint8_t *data, uint16_t len)
-{
-    if (!sle_uart_server_is_ready()) return ERRCODE_FAIL;
-    if (data == NULL || len == 0) return ERRCODE_FAIL;
-    return sle_uart_server_send_report_by_handle(data, len);
-}
-
-/* ========== 初始化 ========== */
-errcode_t sle_uart_server_init(void)
+/* 初始化uuid server */
+errcode_t sle_uart_server_init()
 {
     errcode_t ret;
     ret = sle_uart_announce_register_cbks();
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s sle_uart_announce_register_cbks fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
     ret = sle_conn_register_cbks();
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s sle_conn_register_cbks fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
     ret = sle_ssaps_register_cbks(ssaps_read_request_callbacks, ssaps_write_request_callbacks);
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s sle_ssaps_register_cbks fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
     ret = EnableSle();
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
-    osal_printk("%s init ok\r\n", SLE_UART_SERVER_LOG);
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s enable_sle fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
+    printf("%s init ok\r\n", SLE_UART_SERVER_LOG);
     return ERRCODE_SLE_SUCCESS;
 }
 
@@ -626,79 +601,53 @@ errcode_t sle_enable_server_cbk(void)
 {
     errcode_t ret;
     ret = sle_uart_server_add();
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s sle_uart_server_add fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
     ret = sle_uart_server_adv_init();
-    if (ret != ERRCODE_SLE_SUCCESS) return ret;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        printf("%s sle_uart_server_adv_init fail :%x\r\n", SLE_UART_SERVER_LOG, ret);
+        return ret;
+    }
     return ERRCODE_SLE_SUCCESS;
 }
 
-uint32_t UartSleSendData(uint8_t *data, uint8_t length)
+/* 发送完整帧数据到SLE（已不再额外加序号，利用ESP32协议自带序号） */
+uint32_t UartSleSendData(uint8_t *data, uint16_t length)
 {
-    osal_mdelay(DELAY_100MS);
-    return sle_uart_server_send_report_by_handle(data, length);
+    int ret;
+    ret = sle_uart_server_send_report_by_handle(data, length);
+    if (ret != 0) {
+        printf("%s [SLE TX] send fail, ret=%d\r\n", SLE_UART_SERVER_LOG, ret);
+    }
+    return ret;
 }
 
-/* ========== 主任务 ========== */
-static void SleTask(void *arg)
+static void SleTask(char *arg)
 {
     (void)arg;
-    osal_printk("====SleTask Server Begins====\r\n");
-    osal_msleep(1000);
-    AudioUartInit();
+    usleep(USLEEP_1000000);
+    UartInitConfig();
     sle_uart_server_init();
-
-    /* ★ 创建发送队列 */
-    g_tx_queue = osMessageQueueNew(TX_QUEUE_SLOTS * 2, sizeof(tx_q_item_t), NULL);
-    if (g_tx_queue == NULL) {
-        osal_printk("%s TX queue create FAIL\r\n", SLE_UART_SERVER_LOG);
-        return;
-    }
-    osal_printk("%s TX queue created\r\n", SLE_UART_SERVER_LOG);
-
-    /* ★ 主循环：从队列取帧，通过 SLE 发送 */
-    while (1) {
-        tx_q_item_t item;
-        if (osMessageQueueGet(g_tx_queue, &item, NULL, osWaitForever) == osOK) {
-            uint8_t *frame = g_tx_slots[item.idx];
-            uint16_t len = item.len;
-
-            /* 尝试发送，失败则短暂等待后重试一次 */
-            errcode_t ret = sle_uart_server_send_report_by_handle(frame, len);
-            if (ret != ERRCODE_SUCC) {
-                osal_msleep(2);
-                ret = sle_uart_server_send_report_by_handle(frame, len);
-            }
-
-            if (ret == ERRCODE_SUCC) {
-                g_sle_tx_count++;
-                g_sle_tx_bytes += len;
-                if ((g_sle_tx_count % 200) == 0) {
-                    osal_printk("%s SLE TX: ok=%u fail=%u bytes=%u\r\n",
-                                SLE_UART_SERVER_LOG,
-                                (unsigned)g_sle_tx_count, (unsigned)g_sle_tx_fail,
-                                (unsigned)g_sle_tx_bytes);
-                }
-            } else {
-                g_sle_tx_fail++;
-                if (g_sle_tx_fail <= 10 || (g_sle_tx_fail % 100) == 0) {
-                    osal_printk("%s SLE TX FAIL[%u]: 0x%x\r\n",
-                                SLE_UART_SERVER_LOG, (unsigned)g_sle_tx_fail, (unsigned)ret);
-                }
-            }
-        }
-    }
+    return NULL;
 }
 
 static void SleServerExample(void)
 {
-    osThreadAttr_t attr = {0};
+    osThreadAttr_t attr;
+
     attr.name = "SleTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
     attr.stack_size = TASK_SIZE;
-    attr.priority = osPriorityNormal;
+    attr.priority = PRIO;
     if (osThreadNew(SleTask, NULL, &attr) == NULL) {
-        osal_printk(" Failed to create SleTask!\n");
+        printf(" Falied to create SleTask!\n");
     } else {
-        osal_printk(" create SleTask successfully!\n");
+        printf(" create SleTask successfully !\n");
     }
 }
 

@@ -1,9 +1,17 @@
 /**
- * SLE Audio Client
- * 接收 SLE 音频数据，转发到 UART1 给香橙派
- * 基于同学代码，去掉雷达部分，加上音频转发和统计
+# Copyright (C) 2024 HiHope Open Source Organization .
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
  */
-
 #include "string.h"
 #include "common_def.h"
 #include "osal_debug.h"
@@ -27,42 +35,29 @@
 #include "uart.h"
 #include "errcode.h"
 
-/* ★ MTU 1500 */
-#define SLE_MTU_SIZE_DEFAULT 1500
-
+#define SLE_MTU_SIZE_DEFAULT 1400
 #define SLE_SEEK_INTERVAL_DEFAULT 100
 #define SLE_SEEK_WINDOW_DEFAULT 100
 #define UUID_16BIT_LEN 2
 #define UUID_128BIT_LEN 16
 #define SLE_UART_TASK_DELAY_MS 1000
+#define SLE_UART_WAIT_SLE_CORE_READY_MS 5000
 #ifndef SLE_UART_SERVER_NAME
 #define SLE_UART_SERVER_NAME "sle_uart_server"
 #endif
 #define SLE_UART_CLIENT_LOG "[sle uart client]"
 #define UUID_LEN_2 2
 #define DELAY_100MS 100
-#define TASK_SIZE 0x2000
+#define TASK_SIZE 2048
 #define PRIO 25
+#define USLEEP_1000000 1000000
 
-/* ★★★ 音频 UART1 配置 (TX=15, RX=16, 921600) ★★★ */
-#define AUDIO_UART_NUM      1
-#define AUDIO_UART_BAUD     921600
-#define AUDIO_UART_TX_PIN   15
-#define AUDIO_UART_RX_PIN   16
+/* 音频帧协议常量 */
+#define AUDIO_FRAME_HEADER       0x55AA
+#define AUDIO_FRAME_TAIL         0xAA55
+#define AUDIO_FRAME_OVERHEAD     8        /* 包头2 + 序号2 + 长度2 + 包尾2 */
+#define AUDIO_CHUNK_SAMPLES      512
 
-/* ★★★ 统计变量 ★★★ */
-static uint32_t g_sle_rx_count = 0;
-static uint32_t g_sle_rx_bytes = 0;
-static uint32_t g_uart_tx_count = 0;
-static uint32_t g_uart_tx_bytes = 0;
-static uint32_t g_uart_tx_fail = 0;
-
-/* 序列号跟踪（检测丢包） */
-static uint16_t g_last_seq = 0xFFFF;
-static uint32_t g_seq_gap_count = 0;  /* seq 不连续次数 */
-static uint32_t g_seq_gap_total = 0;  /* 总共丢了多少包 */
-
-/* ---- SLE ---- */
 static char g_sleUuidAppUuid[] = {0x39, 0xBE, 0xA8, 0x80, 0xFC, 0x70, 0x11, 0xEA,
                                   0xB7, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static ssapc_find_service_result_t g_sle_uart_find_service_result = {0};
@@ -74,14 +69,21 @@ ssapc_write_param_t g_sle_uart_send_param = {0};
 uint16_t g_sle_uart_conn_id = 0;
 uint8_t g_client_id = 0;
 
-#define SLE_UART_TRANSFER_SIZE 256
+/* UART缓冲区需 >= 一帧音频大小(1032) */
+#define SLE_UART_TRANSFER_SIZE 1200
 static uint8_t g_app_uart_rx_buff[SLE_UART_TRANSFER_SIZE] = {0};
-uint8_t receive_buf[1500] = {0};
-
+uint8_t receive_buf[1400] = {0}; /* match MTU */
 static uart_buffer_config_t g_app_uart_buffer_config = {
     .rx_buffer = g_app_uart_rx_buff,
-    .rx_buffer_size = SLE_UART_TRANSFER_SIZE
-};
+    .rx_buffer_size = SLE_UART_TRANSFER_SIZE};
+
+/* ===== 丢包检测统计（利用ESP32协议中的 sequence_number 字段）===== */
+static uint16_t g_expectedSeq = 0;        /* 期望收到的下一个包序号 */
+static uint32_t g_totalRecvPktCount = 0;   /* 实际收到的包总数 */
+static uint32_t g_lostPktCount = 0;        /* 丢包总数 */
+static uint8_t  g_seqInitialized = 0;      /* 首包标记 */
+/* 协商后的实际MTU大小 */
+static uint16_t g_negotiatedMtu = 0;
 
 uint16_t get_g_sle_uart_conn_id(void)
 {
@@ -95,62 +97,31 @@ ssapc_write_param_t *get_g_sle_uart_send_param(void)
 
 static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
 {
-    errcode_t ret;
-    if (length > 0) {
-        ret = uart_sle_client_send_data((uint8_t *)buffer, (uint8_t)length);
-        if (ret != 0) {
-            osal_printk("\r\n send_data_fail:%d\r\n", ret);
-        }
-    }
+    /* Client端UART1暂不需要向Server回传数据，保留空回调 */
+    (void)buffer;
+    (void)length;
+    (void)error;
 }
 
 static void UartInitConfig(void)
 {
     uart_attr_t attr = {
-        .baud_rate = 115200,
+        .baud_rate = 921600,
         .data_bits = UART_DATA_BIT_8,
         .stop_bits = UART_STOP_BIT_1,
         .parity = UART_PARITY_NONE};
 
     uart_pin_config_t pin_config = {
-        .tx_pin = 0,
-        .rx_pin = 0,
+        .tx_pin = 15,
+        .rx_pin = 16,
         .cts_pin = PIN_NONE,
         .rts_pin = PIN_NONE};
-    uapi_uart_deinit(0);
-    uapi_uart_init(0, &pin_config, &attr, NULL, &g_app_uart_buffer_config);
-    (void)uapi_uart_register_rx_callback(0, UART_RX_CONDITION_FULL_OR_IDLE,
+    uapi_uart_deinit(1);
+    uapi_uart_init(1, &pin_config, &attr, NULL, &g_app_uart_buffer_config);
+    (void)uapi_uart_register_rx_callback(1, UART_RX_CONDITION_FULL_OR_IDLE,
                                          1, uart_rx_callback);
 }
 
-/* ★★★ 音频 UART1 初始化（发送给香橙派） ★★★ */
-static void AudioUartInit(void)
-{
-    uart_attr_t attr = {
-        .baud_rate = AUDIO_UART_BAUD,
-        .data_bits = UART_DATA_BIT_8,
-        .stop_bits = UART_STOP_BIT_1,
-        .parity = UART_PARITY_NONE
-    };
-    uart_pin_config_t pin_config = {
-        .tx_pin = AUDIO_UART_TX_PIN,
-        .rx_pin = AUDIO_UART_RX_PIN,
-        .cts_pin = PIN_NONE,
-        .rts_pin = PIN_NONE
-    };
-
-    uapi_uart_deinit(AUDIO_UART_NUM);
-    errcode_t ret = uapi_uart_init(AUDIO_UART_NUM, &pin_config, &attr, NULL, NULL);
-    if (ret != ERRCODE_SUCC) {
-        osal_printk("%s Audio UART%d init fail: %x\r\n", SLE_UART_CLIENT_LOG, AUDIO_UART_NUM, ret);
-        return;
-    }
-    osal_printk("%s Audio UART%d ok @ %d, TX=%d RX=%d\r\n",
-                SLE_UART_CLIENT_LOG, AUDIO_UART_NUM, AUDIO_UART_BAUD,
-                AUDIO_UART_TX_PIN, AUDIO_UART_RX_PIN);
-}
-
-/* ========== 扫描相关（不动） ========== */
 void SleUartStartScan(void)
 {
     SleSeekParam param = {0};
@@ -168,7 +139,7 @@ void SleUartStartScan(void)
 static void sle_uart_client_sample_sle_enable_cbk(errcode_t status)
 {
     if (status != 0) {
-        osal_printk("%s sle_enable_cbk, status error\r\n", SLE_UART_CLIENT_LOG);
+        osal_printk("%s sle_uart_client_sample_sle_enable_cbk,status error\r\n", SLE_UART_CLIENT_LOG);
     } else {
         osal_msleep(SLE_UART_TASK_DELAY_MS);
         SleUartStartScan();
@@ -178,20 +149,17 @@ static void sle_uart_client_sample_sle_enable_cbk(errcode_t status)
 static void sle_uart_client_sample_seek_enable_cbk(errcode_t status)
 {
     if (status != 0) {
-        osal_printk("%s seek_enable_cbk, status error\r\n", SLE_UART_CLIENT_LOG);
+        osal_printk("%s sle_uart_client_sample_seek_enable_cbk, status error\r\n", SLE_UART_CLIENT_LOG);
     }
 }
 
 static void sle_uart_client_sample_seek_result_info_cbk(SleSeekResultInfo *seek_result_data)
 {
+    osal_printk("%s sle uart scan data :%s\r\n", SLE_UART_CLIENT_LOG, seek_result_data->data);
     if (seek_result_data == NULL) {
-        osal_printk("%s seek_result_data NULL\r\n", SLE_UART_CLIENT_LOG);
-        return;
-    }
-    osal_printk("%s scan data :%s\r\n", SLE_UART_CLIENT_LOG, seek_result_data->data);
-    if (strstr((const char *)seek_result_data->data, SLE_UART_SERVER_NAME) != NULL) {
-        (void)memcpy_s(&g_sle_uart_remote_addr, sizeof(g_sle_uart_remote_addr),
-                       &seek_result_data->addr, sizeof(seek_result_data->addr));
+        osal_printk("status error\r\n");
+    } else if (strstr((const char *)seek_result_data->data, SLE_UART_SERVER_NAME) != NULL) {
+        memcpy_s(&g_sle_uart_remote_addr, sizeof(sle_addr_t), &seek_result_data->addr, sizeof(sle_addr_t));
         SleStopSeek();
     }
 }
@@ -199,7 +167,7 @@ static void sle_uart_client_sample_seek_result_info_cbk(SleSeekResultInfo *seek_
 static void sle_uart_client_sample_seek_disable_cbk(errcode_t status)
 {
     if (status != 0) {
-        osal_printk("%s seek_disable_cbk, status error = %x\r\n", SLE_UART_CLIENT_LOG, status);
+        osal_printk("%s sle_uart_client_sample_seek_disable_cbk,status error = %x\r\n", SLE_UART_CLIENT_LOG, status);
     } else {
         SleConnectRemoteDevice(&g_sle_uart_remote_addr);
     }
@@ -214,33 +182,43 @@ static void SleUartClientSampleSeekCbkRegister(void)
     sle_announce_seek_register_callbacks(&g_sle_uart_seek_cbk);
 }
 
-/* ========== 连接回调 ========== */
 static void sle_uart_client_sample_connect_state_changed_cbk(uint16_t conn_id, const SleAddr *addr,
-    SleAcbStateType conn_state, SlePairStateType pair_state, SleDiscReasonType disc_reason)
+                                                             SleAcbStateType conn_state, SlePairStateType pair_state,
+                                                             SleDiscReasonType disc_reason)
 {
+    unused(addr);
     unused(pair_state);
     osal_printk("%s conn state changed disc_reason:0x%x\r\n", SLE_UART_CLIENT_LOG, disc_reason);
     g_sle_uart_conn_id = conn_id;
     if (conn_state == SLE_ACB_STATE_CONNECTED) {
         osal_printk("%s SLE_ACB_STATE_CONNECTED\r\n", SLE_UART_CLIENT_LOG);
+        SsapcExchangeInfo info = {0};
+        info.mtuSize = SLE_MTU_SIZE_DEFAULT;
+        info.version = 1;
+        osal_printk("%s [MTU] requesting MTU = %d\r\n", SLE_UART_CLIENT_LOG, SLE_MTU_SIZE_DEFAULT);
+        SsapcExchangeInfoReq(0, conn_id, &info);
         SlePairRemoteDevice(addr);
-        /* 统计清零 */
-        g_sle_rx_count = 0;
-        g_sle_rx_bytes = 0;
-        g_uart_tx_count = 0;
-        g_uart_tx_bytes = 0;
-        g_uart_tx_fail = 0;
-        g_last_seq = 0xFFFF;
-        g_seq_gap_count = 0;
-        g_seq_gap_total = 0;
+        /* 连接时重置丢包统计 */
+        g_expectedSeq = 0;
+        g_totalRecvPktCount = 0;
+        g_lostPktCount = 0;
+        g_seqInitialized = 0;
     } else if (conn_state == SLE_ACB_STATE_NONE) {
         osal_printk("%s SLE_ACB_STATE_NONE\r\n", SLE_UART_CLIENT_LOG);
     } else if (conn_state == SLE_ACB_STATE_DISCONNECTED) {
-        osal_printk("%s DISCONNECTED. STAT: sle_rx=%u uart_tx=%u uart_fail=%u seq_gap=%u(lost~%u)\r\n",
-                    SLE_UART_CLIENT_LOG,
-                    (unsigned)g_sle_rx_count, (unsigned)g_uart_tx_count,
-                    (unsigned)g_uart_tx_fail,
-                    (unsigned)g_seq_gap_count, (unsigned)g_seq_gap_total);
+        osal_printk("%s SLE_ACB_STATE_DISCONNECTED\r\n", SLE_UART_CLIENT_LOG);
+        /* 断连时打印丢包统计汇总 */
+        uint32_t totalExpected = g_totalRecvPktCount + g_lostPktCount;
+        osal_printk("%s [PKT LOSS] === DISCONNECT SUMMARY ===\r\n", SLE_UART_CLIENT_LOG);
+        osal_printk("%s [PKT LOSS]   total_recv   = %u\r\n", SLE_UART_CLIENT_LOG, g_totalRecvPktCount);
+        osal_printk("%s [PKT LOSS]   total_lost   = %u\r\n", SLE_UART_CLIENT_LOG, g_lostPktCount);
+        if (totalExpected > 0) {
+            osal_printk("%s [PKT LOSS]   loss_rate    = %u.%02u%%\r\n",
+                        SLE_UART_CLIENT_LOG,
+                        (g_lostPktCount * 100) / totalExpected,
+                        ((g_lostPktCount * 10000) / totalExpected) % 100);
+        }
+        g_negotiatedMtu = 0;
         SleRemovePairedRemoteDevice(addr);
         SleUartStartScan();
     } else {
@@ -248,36 +226,21 @@ static void sle_uart_client_sample_connect_state_changed_cbk(uint16_t conn_id, c
     }
 }
 
-static void sle_uart_client_sample_pair_complete_cbk(uint16_t conn_id, const SleAddr *addr,
-    errcode_t status)
-{
-    (void)addr;
-    osal_printk("%s pair complete conn_id:%d status:0x%x\r\n",
-           SLE_UART_CLIENT_LOG, conn_id, status);
-
-    if (status == ERRCODE_SUCC) {
-        SsapcExchangeInfo info = {0};
-        info.mtuSize = SLE_MTU_SIZE_DEFAULT;
-        info.version = 1;
-        SsapcExchangeInfoReq(0, conn_id, &info);
-        osal_printk("%s MTU exchange requested: %u\r\n",
-               SLE_UART_CLIENT_LOG, SLE_MTU_SIZE_DEFAULT);
-    }
-}
-
 static void SleUartClientSampleConnectCbkRegister(void)
 {
     g_sle_uart_connect_cbk.connectStateChangedCb = sle_uart_client_sample_connect_state_changed_cbk;
-    g_sle_uart_connect_cbk.pairCompleteCb = sle_uart_client_sample_pair_complete_cbk;
     SleConnectionRegisterCallbacks(&g_sle_uart_connect_cbk);
 }
 
-/* ========== SSAPC 回调（不动） ========== */
-static void sle_uart_client_sample_exchange_info_cbk(uint8_t client_id, uint16_t conn_id,
-    ssap_exchange_info_t *param, errcode_t status)
+static void sle_uart_client_sample_exchange_info_cbk(uint8_t client_id, uint16_t conn_id, ssap_exchange_info_t *param,
+                                                     errcode_t status)
 {
-    osal_printk("%s exchange_info_cbk client:%d status:%d mtu:%d ver:%d\r\n",
-           SLE_UART_CLIENT_LOG, client_id, status, param->mtu_size, param->version);
+    osal_printk("%s exchange_info_cbk client id:%d status:%d\r\n", SLE_UART_CLIENT_LOG,
+           client_id, status);
+    g_negotiatedMtu = param->mtu_size;
+    osal_printk("%s [MTU] negotiated MTU = %d, version = %d\r\n", SLE_UART_CLIENT_LOG,
+           g_negotiatedMtu, param->version);
+
     ssapc_find_structure_param_t find_param = {0};
     find_param.type = 1;
     find_param.start_hdl = 1;
@@ -287,172 +250,199 @@ static void sle_uart_client_sample_exchange_info_cbk(uint8_t client_id, uint16_t
 }
 
 static void sle_uart_client_sample_find_structure_cbk(uint8_t client_id, uint16_t conn_id,
-    ssapc_find_service_result_t *service, errcode_t status)
+                                                      ssapc_find_service_result_t *service,
+                                                      errcode_t status)
 {
-    osal_printk("%s find_structure_cbk client:%d conn:%d status:%d\r\n",
-           SLE_UART_CLIENT_LOG, client_id, conn_id, status);
+    osal_printk("%s find structure cbk client:%d conn_id:%d status:%d\r\n", SLE_UART_CLIENT_LOG,
+           client_id, conn_id, status);
+    osal_printk("%s find structure start_hdl:[0x%02x], end_hdl:[0x%02x], uuid len:%d\r\n", SLE_UART_CLIENT_LOG,
+           service->start_hdl, service->end_hdl,
+           service->uuid.len);
     g_sle_uart_find_service_result.start_hdl = service->start_hdl;
     g_sle_uart_find_service_result.end_hdl = service->end_hdl;
-    memcpy_s(&g_sle_uart_find_service_result.uuid, sizeof(sle_uuid_t),
-             &service->uuid, sizeof(sle_uuid_t));
+    memcpy_s(&g_sle_uart_find_service_result.uuid, sizeof(sle_uuid_t), &service->uuid, sizeof(sle_uuid_t));
 }
 
 static void sle_uart_client_sample_find_property_cbk(uint8_t client_id, uint16_t conn_id,
-    ssapc_find_property_result_t *property, errcode_t status)
+                                                     ssapc_find_property_result_t *property, errcode_t status)
 {
-    osal_printk("%s find_property_cbk client:%d conn:%d handle:%d status:%d\r\n",
-           SLE_UART_CLIENT_LOG, client_id, conn_id, property->handle, status);
+    osal_printk("%s find_property_cbk, client id:%d, conn id:%d, operate ind:%d,"
+           "desc count:%d status:%d handle:%d\r\n",
+           SLE_UART_CLIENT_LOG,
+           client_id, conn_id,
+           property->operate_indication,
+           property->descriptors_count, status, property->handle);
     g_sle_uart_send_param.handle = property->handle;
     g_sle_uart_send_param.type = SSAP_PROPERTY_TYPE_VALUE;
 }
 
 static void sle_uart_client_sample_find_structure_cmp_cbk(uint8_t client_id, uint16_t conn_id,
-    ssapc_find_structure_result_t *structure_result, errcode_t status)
+                                                          ssapc_find_structure_result_t *structure_result,
+                                                          errcode_t status)
 {
     unused(conn_id);
-    osal_printk("%s find_structure_cmp_cbk client:%d status:%d type:%d\r\n",
-           SLE_UART_CLIENT_LOG, client_id, status, structure_result->type);
-    osal_printk("%s ===== Ready to receive audio! =====\r\n", SLE_UART_CLIENT_LOG);
+    osal_printk("%s find_structure_cmp_cbk, client id:%d status:%d type:%d uuid len:%d\r\n",
+           SLE_UART_CLIENT_LOG, client_id, status, structure_result->type, structure_result->uuid.len);
 }
 
 static void sle_uart_client_sample_write_cfm_cb(uint8_t client_id, uint16_t conn_id,
-    ssapc_write_result_t *write_result, errcode_t status)
+                                                ssapc_write_result_t *write_result, errcode_t status)
 {
-    osal_printk("%s write_cfm conn:%d client:%d status:%d handle:%02x\r\n",
-           SLE_UART_CLIENT_LOG, conn_id, client_id, status, write_result->handle);
-}
-
-/* ★★★ notification 回调：接收音频数据 → 检测丢包 → 转发 UART1 ★★★ */
-void ssapc_notification_callbacks(uint8_t client_id, uint16_t conn_id,
-                                 ssapc_handle_value_t *data, errcode_t status)
-{
-    (void)client_id;
-    (void)conn_id;
-
-    if (status != ERRCODE_SUCC || data == NULL || data->data == NULL || data->data_len == 0) {
-        return;
-    }
-
-    g_sle_rx_count++;
-    g_sle_rx_bytes += data->data_len;
-
-    /* ★ 检测丢包：解析协议中的 seq 字段
-     * 协议格式: [0x55AA(2)] [seq(2)] [payload_len(2)] [payload(N)] [0xAA55(2)]
-     * seq 在偏移 2-3 字节处
-     */
-    if (data->data_len >= 6) {
-        uint16_t hdr = (uint16_t)(data->data[0] | (data->data[1] << 8));
-        if (hdr == 0x55AA) {
-            uint16_t seq = (uint16_t)(data->data[2] | (data->data[3] << 8));
-            if (g_last_seq != 0xFFFF) {
-                uint16_t expected = (uint16_t)(g_last_seq + 1);
-                if (seq != expected) {
-                    uint16_t gap;
-                    if (seq > expected) {
-                        gap = seq - expected;
-                    } else {
-                        gap = (uint16_t)(65536 - expected + seq);
-                    }
-                    g_seq_gap_count++;
-                    g_seq_gap_total += gap;
-                    if (g_seq_gap_count <= 10 || (g_seq_gap_count % 50) == 0) {
-                        osal_printk("%s SEQ GAP! expected=%u got=%u lost=%u (total_gaps=%u lost~%u)\r\n",
-                                    SLE_UART_CLIENT_LOG,
-                                    (unsigned)expected, (unsigned)seq, (unsigned)gap,
-                                    (unsigned)g_seq_gap_count, (unsigned)g_seq_gap_total);
-                    }
-                }
-            }
-            g_last_seq = seq;
-        }
-    }
-
-    /* 每 200 包打印统计 */
-    if ((g_sle_rx_count % 200) == 0) {
-        osal_printk("%s SLE RX: pkt=%u bytes=%u | UART TX: pkt=%u bytes=%u fail=%u | SEQ gap=%u lost~%u\r\n",
-                    SLE_UART_CLIENT_LOG,
-                    (unsigned)g_sle_rx_count, (unsigned)g_sle_rx_bytes,
-                    (unsigned)g_uart_tx_count, (unsigned)g_uart_tx_bytes, (unsigned)g_uart_tx_fail,
-                    (unsigned)g_seq_gap_count, (unsigned)g_seq_gap_total);
-    }
-
-    /* 前 3 包打印详细 */
-    if (g_sle_rx_count <= 3) {
-        osal_printk("%s SLE RX[%u]: %02x %02x %02x %02x %02x %02x %02x %02x (len=%u)\r\n",
-                    SLE_UART_CLIENT_LOG, (unsigned)g_sle_rx_count,
-                    data->data[0], data->data[1], data->data[2], data->data[3],
-                    data->data[4], data->data[5], data->data[6], data->data[7],
-                    (unsigned)data->data_len);
-    }
-
-    /* ★ 转发到 UART1（发给香橙派） */
-    errcode_t ret = uapi_uart_write(AUDIO_UART_NUM, data->data, data->data_len, 0);
-    if (ret == ERRCODE_SUCC) {
-        g_uart_tx_count++;
-        g_uart_tx_bytes += data->data_len;
-    } else {
-        g_uart_tx_fail++;
-        if (g_uart_tx_fail <= 5) {
-            osal_printk("%s UART TX fail: ret=%x len=%u\r\n",
-                        SLE_UART_CLIENT_LOG, (unsigned)ret, (unsigned)data->data_len);
-        }
-    }
-}
-
-void ssapc_indication_callbacks(uint8_t client_id, uint16_t conn_id,
-                                ssapc_handle_value_t *data, errcode_t status)
-{
-    (void)client_id; (void)conn_id; (void)data; (void)status;
+    osal_printk("%s write_cfm_cb, conn_id:%d client_id:%d status:%d handle:%02x type:%02x\r\n",
+           SLE_UART_CLIENT_LOG,
+           conn_id, client_id, status, write_result->handle, write_result->type);
 }
 
 static void sle_uart_client_sample_ssapc_cbk_register(ssapc_notification_callback notification_cb,
                                                       ssapc_indication_callback indication_cb)
 {
-    g_sle_uart_ssapc_cbk.exchange_info_cb      = sle_uart_client_sample_exchange_info_cbk;
-    g_sle_uart_ssapc_cbk.find_structure_cb     = sle_uart_client_sample_find_structure_cbk;
+    g_sle_uart_ssapc_cbk.exchange_info_cb = sle_uart_client_sample_exchange_info_cbk;
+    g_sle_uart_ssapc_cbk.find_structure_cb = sle_uart_client_sample_find_structure_cbk;
     g_sle_uart_ssapc_cbk.ssapc_find_property_cbk = sle_uart_client_sample_find_property_cbk;
     g_sle_uart_ssapc_cbk.find_structure_cmp_cb = sle_uart_client_sample_find_structure_cmp_cbk;
-    g_sle_uart_ssapc_cbk.write_cfm_cb          = sle_uart_client_sample_write_cfm_cb;
-    g_sle_uart_ssapc_cbk.notification_cb       = notification_cb;
-    g_sle_uart_ssapc_cbk.indication_cb         = indication_cb;
+    g_sle_uart_ssapc_cbk.write_cfm_cb = sle_uart_client_sample_write_cfm_cb;
+    g_sle_uart_ssapc_cbk.notification_cb = notification_cb;
+    g_sle_uart_ssapc_cbk.indication_cb = indication_cb;
     ssapc_register_callbacks(&g_sle_uart_ssapc_cbk);
 }
 
-/* ========== Client 注册（不动） ========== */
 static errcode_t sle_uuid_client_register(void)
 {
+    errcode_t ret;
     SleUuid app_uuid = {0};
+
+    osal_printk("[uuid client] ssapc_register_client\r\n");
     app_uuid.len = sizeof(g_sleUuidAppUuid);
     if (memcpy_s(app_uuid.uuid, app_uuid.len, g_sleUuidAppUuid, sizeof(g_sleUuidAppUuid)) != EOK) {
         return ERRCODE_SLE_FAIL;
     }
-    return SsapcRegisterClient(&app_uuid, &g_client_id);
+    ret = SsapcRegisterClient(&app_uuid, &g_client_id);
+    return ret;
 }
 
-/* ========== 发送函数（不动） ========== */
-errcode_t sle_uart_client_send_report_by_handle(const uint8_t *data, uint8_t len)
+/* ---------- 核心回调：收到 server 通过SLE转发的音频帧 ---------- */
+void ssapc_notification_callbacks(uint8_t client_id,
+                                  uint16_t conn_id, ssapc_handle_value_t *data,
+                                  errcode_t status)
 {
-    if (data == NULL || len == 0 || len > sizeof(receive_buf)) return ERRCODE_FAIL;
-    if (g_sle_uart_conn_id == 0 || g_sle_uart_send_param.handle == 0) return ERRCODE_FAIL;
+    (void)client_id;
+    (void)conn_id;
+    (void)status;
 
-    ssapc_write_param_t param = {0};
-    param.handle   = g_sle_uart_send_param.handle;
-    param.type     = SSAP_PROPERTY_TYPE_VALUE;
-    param.data     = receive_buf;
-    param.data_len = len;
-    if (memcpy_s(param.data, sizeof(receive_buf), data, len) != EOK) return ERRCODE_FAIL;
+    uint16_t dataLen = data->data_len;
 
-    return SsapcWriteReq(g_client_id, g_sle_uart_conn_id, &param);
+    /*
+     * 帧完整性校验：
+     *   最小长度 = 8 (header 2 + seq 2 + len 2 + tail 2)
+     *   检查包头 0x55AA 和包尾 0xAA55（小端存储）
+     */
+    if (dataLen < AUDIO_FRAME_OVERHEAD) {
+        osal_printk("%s [SLE RX] frame too short: %d bytes, discard\r\n",
+                    SLE_UART_CLIENT_LOG, dataLen);
+        return;
+    }
+
+    /* 检查包头（小端：data[0]=0xAA, data[1]=0x55 → 合成 0x55AA） */
+    uint16_t header = (uint16_t)data->data[0] | ((uint16_t)data->data[1] << 8);
+    /* 检查包尾（小端：data[len-2]=0x55, data[len-1]=0xAA → 合成 0xAA55） */
+    uint16_t tail = (uint16_t)data->data[dataLen - 2] | ((uint16_t)data->data[dataLen - 1] << 8);
+
+    if (header != AUDIO_FRAME_HEADER || tail != AUDIO_FRAME_TAIL) {
+        osal_printk("%s [SLE RX] bad frame: header=0x%04X tail=0x%04X, discard\r\n",
+                    SLE_UART_CLIENT_LOG, header, tail);
+        return;
+    }
+
+    /* 解析 ESP32 协议中的 sequence_number（偏移2~3，小端） */
+    uint16_t recvSeq = (uint16_t)data->data[2] | ((uint16_t)data->data[3] << 8);
+    /* 解析 payload_length（偏移4~5，小端） */
+    uint16_t payloadLen = (uint16_t)data->data[4] | ((uint16_t)data->data[5] << 8);
+
+    g_totalRecvPktCount++;
+
+    /* ---------- 丢包检测 ---------- */
+    if (!g_seqInitialized) {
+        /* 首包：以收到的序号为基准 */
+        g_expectedSeq = recvSeq;
+        g_seqInitialized = 1;
+        osal_printk("%s [PKT LOSS] first pkt seq=%u, start tracking\r\n",
+                    SLE_UART_CLIENT_LOG, recvSeq);
+    }
+
+    if (recvSeq != g_expectedSeq) {
+        /*
+         * 序号是 uint16_t，ESP32 的 sequence_number 也是 uint16_t，
+         * 需要处理回绕：0xFFFF → 0x0000
+         */
+        uint16_t gap;
+        if (recvSeq > g_expectedSeq) {
+            gap = recvSeq - g_expectedSeq;
+        } else {
+            /* 回绕情况：比如 expected=65534, recv=1 → 实际跳了3包 */
+            gap = (uint16_t)(0x10000UL + recvSeq - g_expectedSeq);
+        }
+
+        if (gap <= 1000) {
+            /* 正常丢包（gap合理范围内） */
+            g_lostPktCount += gap;
+            osal_printk("%s [PKT LOSS] expected_seq=%u, got_seq=%u, lost=%u, total_lost=%u\r\n",
+                        SLE_UART_CLIENT_LOG, g_expectedSeq, recvSeq, gap, g_lostPktCount);
+        } else {
+            /* gap太大，可能是乱序或重复包，仅打印警告 */
+            osal_printk("%s [PKT LOSS] abnormal: expected_seq=%u, got_seq=%u, gap=%u (ignored)\r\n",
+                        SLE_UART_CLIENT_LOG, g_expectedSeq, recvSeq, gap);
+        }
+    }
+
+    /* 下一个期望序号（处理uint16回绕） */
+    g_expectedSeq = recvSeq + 1;
+
+    /* 每100包打印一次统计摘要 */
+    if (g_totalRecvPktCount % 100 == 0) {
+        uint32_t totalExpected = g_totalRecvPktCount + g_lostPktCount;
+        osal_printk("%s [PKT LOSS] --- periodic stats --- recv=%u, lost=%u, total_expected=%u",
+                    SLE_UART_CLIENT_LOG, g_totalRecvPktCount, g_lostPktCount, totalExpected);
+        if (totalExpected > 0) {
+            osal_printk(", loss_rate=%u.%02u%%",
+                        (g_lostPktCount * 100) / totalExpected,
+                        ((g_lostPktCount * 10000) / totalExpected) % 100);
+        }
+        osal_printk("\r\n");
+    }
+
+    osal_printk("%s [SLE RX] seq=%u, sle_len=%u, payload_len=%u, recv=%u, lost=%u\r\n",
+                SLE_UART_CLIENT_LOG, recvSeq, dataLen, payloadLen,
+                g_totalRecvPktCount, g_lostPktCount);
+
+    /* ---------- 提取音频数据，转发到UART1 ----------
+     * 只发音频payload部分（去掉包头包尾序号），
+     * 让下游设备直接拿到PCM裸数据。
+     * 如果下游也需要完整协议帧，改为发送 data->data, dataLen 即可。
+     */
+    uint8_t *audioPayload = &data->data[6]; /* 偏移6开始是音频数据 */
+
+    if (payloadLen > 0 && payloadLen <= (dataLen - AUDIO_FRAME_OVERHEAD)) {
+        int32_t uartRet = uapi_uart_write(1, audioPayload, payloadLen, 0);
+        osal_printk("%s [UART1 TX] forwarded %u bytes PCM to uart1, ret=%d\r\n",
+                    SLE_UART_CLIENT_LOG, payloadLen, uartRet);
+    } else {
+        osal_printk("%s [UART1 TX] invalid payload_len=%u for frame_len=%u, skip\r\n",
+                    SLE_UART_CLIENT_LOG, payloadLen, dataLen);
+    }
 }
 
-int uart_sle_client_send_data(uint8_t *data, uint8_t length)
+void ssapc_indication_callbacks(
+    uint8_t client_id, uint16_t conn_id,
+    ssapc_handle_value_t *data,
+    errcode_t status)
 {
-    osal_mdelay(DELAY_100MS);
-    return sle_uart_client_send_report_by_handle(data, length);
+    (void)client_id;
+    (void)conn_id;
+    (void)data;
+    (void)status;
 }
 
-/* ========== 初始化（不动） ========== */
-void SleUartClientInit(void)
+void SleUartClientInit()
 {
     uint8_t local_addr[SLE_ADDR_LEN] = {0x13, 0x67, 0x5c, 0x07, 0x00, 0x51};
     SleAddr local_address;
@@ -461,44 +451,35 @@ void SleUartClientInit(void)
     sle_uuid_client_register();
     SleUartClientSampleSeekCbkRegister();
     SleUartClientSampleConnectCbkRegister();
-    sle_uart_client_sample_ssapc_cbk_register(ssapc_notification_callbacks,
-                                              ssapc_indication_callbacks);
+    sle_uart_client_sample_ssapc_cbk_register(ssapc_notification_callbacks, ssapc_indication_callbacks);
     EnableSle();
     SleSetLocalAddr(&local_address);
 }
 
-/* ========== 主任务 ========== */
-static void SleTask(void *arg)
+static void SleTask(char *arg)
 {
     (void)arg;
-
-    osal_msleep(1000);
-    UartInitConfig();     /* UART0 调试口 */
-    AudioUartInit();      /* ★ UART1 音频输出口 */
+    usleep(USLEEP_1000000);
+    UartInitConfig();
     SleUartClientInit();
-
-    /* 主循环：定期打印统计 */
-    while (1) {
-        osal_msleep(5000);
-        osal_printk("%s [5s STAT] SLE RX: pkt=%u bytes=%u | UART TX: pkt=%u fail=%u | SEQ gap=%u lost~%u\r\n",
-                    SLE_UART_CLIENT_LOG,
-                    (unsigned)g_sle_rx_count, (unsigned)g_sle_rx_bytes,
-                    (unsigned)g_uart_tx_count, (unsigned)g_uart_tx_fail,
-                    (unsigned)g_seq_gap_count, (unsigned)g_seq_gap_total);
-    }
+    return NULL;
 }
 
 static void SleClientExample(void)
 {
-    osThreadAttr_t attr = {0};
-    attr.name       = "SleTask";
+    osThreadAttr_t attr;
+    attr.name = "SleTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
     attr.stack_size = TASK_SIZE;
-    attr.priority   = PRIO;
+    attr.priority = PRIO;
 
     if (osThreadNew(SleTask, NULL, &attr) == NULL) {
-        osal_printk(" Failed to create SleTask!\n");
+        osal_printk(" Falied to create SleTask!\n");
     } else {
-        osal_printk(" create SleTask successfully!\n");
+        osal_printk(" create SleTask successfully !\n");
     }
 }
 
