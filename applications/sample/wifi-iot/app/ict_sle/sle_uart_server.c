@@ -62,18 +62,21 @@ static uint16_t g_propertyHandle = 0;
 uint16_t g_slePairHdl;
 /* 协商后的实际MTU大小 */
 static uint16_t g_negotiatedMtu = 0;
+/* SLE连接就绪标志：MTU协商完成且配对完成后才允许发数据 */
+static uint8_t g_sleReady = 0;
 
 /*
- * SLE发送缓冲区与UART接收缓冲区
- * 一帧音频最大 1032 字节，SLE notify 缓冲区需要 >= 1032
- * UART接收缓冲区需要能容纳至少一帧完整数据
+ * 缓冲区大小：一帧音频最大 1032 字节
  */
 #define UART_BUFF_LENGTH 1400
 uint8_t g_receiveBuf[UART_BUFF_LENGTH] = {0};
 
 #define UUID_16BIT_LEN 2
 #define UUID_128BIT_LEN 16
-#define printf(fmt, args...) printf(fmt, ##args)
+
+/* ★★★ 修复：printf 改为 osal_printk，原来的递归宏定义导致什么都打印不出来 ★★★ */
+#define printf(fmt, args...) osal_printk(fmt, ##args)
+
 #define SLE_UART_SERVER_LOG "[sle uart server]"
 #define SLE_SERVER_INIT_DELAY_MS 1000
 #define DELAY_100MS 100
@@ -83,7 +86,6 @@ uint8_t g_receiveBuf[UART_BUFF_LENGTH] = {0};
 
 /*
  * UART接收缓冲区大小：必须 >= 一帧音频大小(1032)
- * 原值256太小，改为 1200
  */
 #define SLE_UART_TRANSFER_SIZE 1200
 
@@ -101,9 +103,9 @@ static uint32_t g_sleSendCount = 0;
 
 /* ---------- UART 帧组装状态机 ----------
  * ESP32 一次 write 1032字节，D02 串口可能因IDLE中断拆成多次回调，
- * 所以必须在此按 0x55AA...0xAA55 协议组装完整帧再转发SLE。
+ * 所以必须按 0x55AA...0xAA55 协议组装完整帧再转发SLE。
  */
-#define FRAME_BUF_SIZE (AUDIO_FRAME_MAX_SIZE + 16)  /* 留点余量 */
+#define FRAME_BUF_SIZE (AUDIO_FRAME_MAX_SIZE + 16)
 
 typedef enum {
     PARSE_WAIT_HEADER_LOW,   /* 等 0xAA */
@@ -127,22 +129,19 @@ static FrameParseState g_parseState = PARSE_WAIT_HEADER_LOW;
 /* 收到完整一帧后调用，通过SLE转发 */
 static void OnFrameComplete(void)
 {
-    /*
-     * g_frameBuf 中已按协议存好完整帧:
-     *   [0..1] = 0x55AA
-     *   [2..3] = sequence
-     *   [4..5] = payload_len
-     *   [6 .. 6+payload_len-1] = audio data
-     *   [6+payload_len .. 6+payload_len+1] = 0xAA55
-     * 总长 = 6 + payload_len + 2 = payload_len + 8
-     */
     uint16_t totalLen = g_payloadLen + AUDIO_FRAME_OVERHEAD;
+
+    /* ★ 检查SLE是否就绪 */
+    if (!g_sleReady) {
+        printf("%s [SLE TX] SLE not ready, drop pkt esp_seq=%u\r\n",
+               SLE_UART_SERVER_LOG, g_frameSeq);
+        return;
+    }
 
     g_sleSendCount++;
     printf("%s [SLE TX] pkt #%u (esp_seq=%u), payload=%u, frame=%u bytes\r\n",
            SLE_UART_SERVER_LOG, g_sleSendCount, g_frameSeq, g_payloadLen, totalLen);
 
-    /* 直接把完整帧（含包头包尾）通过SLE发出去 */
     UartSleSendData(g_frameBuf, totalLen);
 }
 
@@ -164,7 +163,6 @@ static void FrameParseByte(uint8_t byte)
                 g_frameBuf[g_frameIdx++] = byte;
                 g_parseState = PARSE_READ_SEQ_LOW;
             } else if (byte == 0xAA) {
-                /* 可能是新包头的低字节，保持 */
                 g_frameIdx = 0;
                 g_frameBuf[g_frameIdx++] = byte;
             } else {
@@ -194,7 +192,6 @@ static void FrameParseByte(uint8_t byte)
             g_frameBuf[g_frameIdx++] = byte;
             g_payloadLen |= ((uint16_t)byte << 8);
             g_payloadRecv = 0;
-            /* 安全检查 */
             if (g_payloadLen > AUDIO_CHUNK_SAMPLES * 2 || g_payloadLen == 0) {
                 printf("%s [PARSE] bad payload_len=%u, reset\r\n", SLE_UART_SERVER_LOG, g_payloadLen);
                 g_parseState = PARSE_WAIT_HEADER_LOW;
@@ -214,7 +211,6 @@ static void FrameParseByte(uint8_t byte)
             break;
 
         case PARSE_WAIT_TAIL_LOW:
-            /* 0xAA55 小端: 第一个字节 0x55 */
             g_frameBuf[g_frameIdx++] = byte;
             if (byte == 0x55) {
                 g_parseState = PARSE_WAIT_TAIL_HIGH;
@@ -227,7 +223,6 @@ static void FrameParseByte(uint8_t byte)
         case PARSE_WAIT_TAIL_HIGH:
             g_frameBuf[g_frameIdx++] = byte;
             if (byte == 0xAA) {
-                /* ★ 完整帧收到 */
                 OnFrameComplete();
             } else {
                 printf("%s [PARSE] bad tail high=0x%02x, reset\r\n", SLE_UART_SERVER_LOG, byte);
@@ -325,10 +320,15 @@ static void sle_uart_uuid_print(SleUuid *uuid)
 static void ssaps_mtu_changed_cbk(uint8_t serverId, uint16_t connId, SsapcExchangeInfo *mtu_size,
                                   errcode_t status)
 {
-    printf("%s ssaps_mtu_changed_cbk server_id:%x, conn_id:%x, mtu_size:%x, status:%x\r\n",
+    printf("%s ssaps_mtu_changed_cbk server_id:%x, conn_id:%x, mtu_size:%d, status:%x\r\n",
            SLE_UART_SERVER_LOG, serverId, connId, mtu_size->mtuSize, status);
     g_negotiatedMtu = mtu_size->mtuSize;
-    printf("%s [MTU] negotiated MTU = %u\r\n", SLE_UART_SERVER_LOG, g_negotiatedMtu);
+    printf("%s [MTU] negotiated MTU = %d\r\n", SLE_UART_SERVER_LOG, g_negotiatedMtu);
+
+    /* ★ MTU协商完成，标记SLE就绪 */
+    g_sleReady = 1;
+    printf("%s [READY] SLE link ready, can forward data now\r\n", SLE_UART_SERVER_LOG);
+
     if (g_slePairHdl == 0) {
         g_slePairHdl = connId + 1;
     }
@@ -512,6 +512,7 @@ static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, 
     if (conn_state == OH_SLE_ACB_STATE_CONNECTED) {
         g_sleConnHdl = connId;
         g_sleSendCount = 0;
+        g_sleReady = 0;  /* ★ 连接时先标记未就绪，等MTU协商完成 */
         ssap_exchange_info_t parameter = {0};
         parameter.mtu_size = SLE_MTU_SIZE_DEFAULT;
         parameter.version = 1;
@@ -522,7 +523,7 @@ static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, 
         g_sleConnHdl = 0;
         g_slePairHdl = 0;
         g_negotiatedMtu = 0;
-        /* 重置帧解析状态 */
+        g_sleReady = 0;
         g_parseState = PARSE_WAIT_HEADER_LOW;
         SleStartAnnounce(SLE_ADV_HANDLE_DEFAULT);
     }
@@ -613,7 +614,7 @@ errcode_t sle_enable_server_cbk(void)
     return ERRCODE_SLE_SUCCESS;
 }
 
-/* 发送完整帧数据到SLE（已不再额外加序号，利用ESP32协议自带序号） */
+/* 发送完整帧数据到SLE */
 uint32_t UartSleSendData(uint8_t *data, uint16_t length)
 {
     int ret;
