@@ -80,7 +80,7 @@ uint8_t g_receiveBuf[UART_BUFF_LENGTH] = {0};
 #define SLE_UART_SERVER_LOG "[sle uart server]"
 #define SLE_SERVER_INIT_DELAY_MS 1000
 #define DELAY_100MS 100
-#define TASK_SIZE 2048
+#define TASK_SIZE 4096
 #define PRIO 25
 #define USLEEP_1000000 1000000
 
@@ -100,6 +100,20 @@ static uart_buffer_config_t g_app_uart_buffer_config = {
 
 /* 发送统计 */
 static uint32_t g_sleSendCount = 0;
+
+/* ======================== 消息队列（异步解耦） ======================== */
+/* 每帧最大228字节，队列深度16，可缓冲约16帧 */
+#define TX_QUEUE_DEPTH   256
+#define TX_MSG_MAX_SIZE  256
+
+typedef struct {
+    uint16_t len;
+    uint8_t  data[TX_MSG_MAX_SIZE];
+} TxMsg;
+
+static osMessageQueueId_t g_txQueue = NULL;
+/* 丢弃计数（队列满时） */
+static uint32_t g_txQueueDropCount = 0;
 
 /* ---------- UART 帧组装状态机 ----------
  * ESP32 一次 write 1032字节，D02 串口可能因IDLE中断拆成多次回调，
@@ -126,23 +140,35 @@ static uint16_t g_payloadRecv = 0;
 static uint16_t g_frameSeq = 0;
 static FrameParseState g_parseState = PARSE_WAIT_HEADER_LOW;
 
-/* 收到完整一帧后调用，通过SLE转发 */
+/* 收到完整一帧后调用：只入队，不直接发SLE */
 static void OnFrameComplete(void)
 {
     uint16_t totalLen = g_payloadLen + AUDIO_FRAME_OVERHEAD;
 
     /* ★ 检查SLE是否就绪 */
     if (!g_sleReady) {
-        printf("%s [SLE TX] SLE not ready, drop pkt esp_seq=%u\r\n",
-               SLE_UART_SERVER_LOG, g_frameSeq);
         return;
     }
 
-    g_sleSendCount++;
-    printf("%s [SLE TX] pkt #%u (esp_seq=%u), payload=%u, frame=%u bytes\r\n",
-           SLE_UART_SERVER_LOG, g_sleSendCount, g_frameSeq, g_payloadLen, totalLen);
+    if (totalLen > TX_MSG_MAX_SIZE) {
+        return;
+    }
 
-    UartSleSendData(g_frameBuf, totalLen);
+    /* 入队而非直接发送 */
+    TxMsg msg;
+    msg.len = totalLen;
+    if (memcpy_s(msg.data, TX_MSG_MAX_SIZE, g_frameBuf, totalLen) != EOK) {
+        return;
+    }
+
+    osStatus_t qs = osMessageQueuePut(g_txQueue, &msg, 0, 0);  /* 不等待 */
+    if (qs != osOK) {
+        g_txQueueDropCount++;
+        if (g_txQueueDropCount % 100 == 1) {
+            printf("%s [QUEUE] full, drop esp_seq=%u (total_drop=%u)\r\n",
+                   SLE_UART_SERVER_LOG, g_frameSeq, g_txQueueDropCount);
+        }
+    }
 }
 
 /* 逐字节喂入解析器 */
@@ -239,7 +265,6 @@ static void FrameParseByte(uint8_t byte)
 static void server_uart_rx_callback(const void *buffer, uint16_t length, bool error)
 {
     if (length > 0) {
-        printf("%s [UART1 RX] recv %d bytes\r\n", SLE_UART_SERVER_LOG, length);
         const uint8_t *data = (const uint8_t *)buffer;
         for (uint16_t i = 0; i < length; i++) {
             FrameParseByte(data[i]);
@@ -487,19 +512,26 @@ static errcode_t sle_uart_server_add(void)
     return ERRCODE_SLE_SUCCESS;
 }
 
-/* 通过handle向client发送数据（支持>255字节） */
+/* 通过handle向client发送数据 - 使用独立内存避免全局缓冲区竞争 */
 errcode_t sle_uart_server_send_report_by_handle(const uint8_t *data, uint16_t len)
 {
     SsapsNtfInd param = {0};
+    uint8_t *txBuf = (uint8_t *)osal_vmalloc(len);
+    if (txBuf == NULL) {
+        return ERRCODE_SLE_FAIL;
+    }
 
     param.handle = g_propertyHandle;
     param.type = SSAP_PROPERTY_TYPE_VALUE;
-    param.value = g_receiveBuf;
+    param.value = txBuf;
     param.valueLen = len;
-    if (memcpy_s(param.value, UART_BUFF_LENGTH, data, len) != EOK) {
+    if (memcpy_s(param.value, len, data, len) != EOK) {
+        osal_vfree(txBuf);
         return ERRCODE_SLE_FAIL;
     }
-    return SsapsNotifyIndicate(g_serverId, g_sleConnHdl, &param);
+    errcode_t ret = SsapsNotifyIndicate(g_serverId, g_sleConnHdl, &param);
+    osal_vfree(txBuf);
+    return ret;
 }
 
 static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, SleAcbStateType conn_state,
@@ -507,7 +539,7 @@ static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, 
 {
     printf("%s connect state changed conn_id:0x%02x, conn_state:0x%x, pair_state:0x%x, disc_reason:0x%x\r\n",
            SLE_UART_SERVER_LOG, connId, conn_state, pair_state, disc_reason);
-    printf("%s addr:%02x:**:**:**:%02x:%02x\r\n", SLE_UART_SERVER_LOG,
+    printf("%s addr:%02x:**:**:%02x:%02x\r\n", SLE_UART_SERVER_LOG,
            addr->addr[BT_INDEX_0], addr->addr[BT_INDEX_4], addr->addr[BT_INDEX_5]);
     if (conn_state == OH_SLE_ACB_STATE_CONNECTED) {
         g_sleConnHdl = connId;
@@ -525,6 +557,11 @@ static void sle_connect_state_changed_cbk(uint16_t connId, const SleAddr *addr, 
         g_negotiatedMtu = 0;
         g_sleReady = 0;
         g_parseState = PARSE_WAIT_HEADER_LOW;
+        /* 断连时清空队列中残留的消息 */
+        if (g_txQueue != NULL) {
+            TxMsg dummy;
+            while (osMessageQueueGet(g_txQueue, &dummy, NULL, 0) == osOK) {}
+        }
         SleStartAnnounce(SLE_ADV_HANDLE_DEFAULT);
     }
 }
@@ -629,9 +666,36 @@ static void SleTask(char *arg)
 {
     (void)arg;
     usleep(USLEEP_1000000);
+
+    /* ★ 创建消息队列 */
+    g_txQueue = osMessageQueueNew(TX_QUEUE_DEPTH, sizeof(TxMsg), NULL);
+    if (g_txQueue == NULL) {
+        printf("%s [FATAL] create tx queue failed!\r\n", SLE_UART_SERVER_LOG);
+        return;
+    }
+    printf("%s [QUEUE] tx queue created, depth=%d\r\n", SLE_UART_SERVER_LOG, TX_QUEUE_DEPTH);
+
     UartInitConfig();
     sle_uart_server_init();
-    return NULL;
+
+    /* ★ 主循环：从队列取帧，发送到SLE */
+    TxMsg msg;
+    while (1) {
+        osStatus_t qs = osMessageQueueGet(g_txQueue, &msg, NULL, osWaitForever);
+        if (qs == osOK) {
+            g_sleSendCount++;
+            /* ★ 去掉每帧的printf，只每500帧打一次统计 */
+            if (g_sleSendCount % 500 == 0) {
+                printf("%s [SLE TX] sent %u pkts, queue_drop=%u, frame=%u bytes\r\n",
+                       SLE_UART_SERVER_LOG, g_sleSendCount, g_txQueueDropCount,msg.len);
+            }
+
+            int ret = sle_uart_server_send_report_by_handle(msg.data, msg.len);
+            if (ret != 0) {
+                printf("%s [SLE TX] send fail, ret=%d\r\n", SLE_UART_SERVER_LOG, ret);
+            }
+        }
+    }
 }
 
 static void SleServerExample(void)
