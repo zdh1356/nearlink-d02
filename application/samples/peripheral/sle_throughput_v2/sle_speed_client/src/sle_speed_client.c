@@ -32,6 +32,15 @@
 #define FRAME_TAIL             0xAA55
 #define FRAME_HDR_SIZE         8      /* header(2)+seq(2)+len(2)+tail(2) */
 
+/* -------- UART发送队列 -------- */
+#define UART_TX_QUEUE_LEN      16
+#define UART_TX_BUF_SIZE       1500
+typedef struct {
+    uint8_t  data[UART_TX_BUF_SIZE];
+    uint16_t len;
+} uart_tx_msg_t;
+static unsigned long g_uart_tx_queue_id = 0;
+
 static uint8_t  g_client_uart_rxbuf[CLIENT_UART_RX_BUFSZ];
 static uart_buffer_config_t g_client_uart_buf = {
     .rx_buffer      = g_client_uart_rxbuf,
@@ -61,6 +70,33 @@ static void client_uart1_init(void)
     uapi_uart_deinit(CLIENT_UART_BUS);
     uapi_uart_init(CLIENT_UART_BUS, &pin, &attr, NULL, &g_client_uart_buf);
     osal_printk("[client] UART1 初始化完成，波特率921600，TX=GPIO15，RX=GPIO16\r\n");
+}
+
+static void uart_tx_thread_function(void)
+{
+    uart_tx_msg_t msg;
+    uint32_t msg_size = sizeof(uart_tx_msg_t);
+    uint32_t tx_ok = 0;
+    uint32_t tx_fail = 0;
+    while (1) {
+        uint32_t ret = osal_msg_queue_read_copy(g_uart_tx_queue_id, &msg, &msg_size, OSAL_WAIT_FOREVER);
+        msg_size = sizeof(uart_tx_msg_t);
+        if (ret != OSAL_SUCCESS || msg.len == 0) {
+            continue;
+        }
+        int32_t uart_ret = uapi_uart_write(CLIENT_UART_BUS, msg.data, msg.len, 1000);
+        if (uart_ret > 0) {
+            tx_ok++;
+        } else {
+            tx_fail++;
+            if (tx_fail <= 3) {
+                osal_printk("[client] UART发送失败 ret=%d len=%u\r\n", uart_ret, msg.len);
+            }
+        }
+        if ((tx_ok + tx_fail) % 100 == 0 && (tx_ok + tx_fail) > 0) {
+            osal_printk("[client] UART发送统计: 成功=%lu 失败=%lu\r\n", tx_ok, tx_fail);
+        }
+    }
 }
 
 #undef THIS_FILE_ID
@@ -157,19 +193,26 @@ static void sle_speed_notification_cb(uint8_t client_id, uint16_t conn_id, ssapc
         }
     }
 
-    /* ---- 转发到 UART1（阻塞发送，timeout=1000ms）---- */
+    /* ---- 入队转发（回调里不阻塞）---- */
     static uint32_t s_uart_ok = 0;
     static uint32_t s_uart_fail = 0;
-    errcode_t uart_ret = uapi_uart_write(CLIENT_UART_BUS, buf, rx_len, 1000);
-    if (uart_ret == ERRCODE_SUCC) {
-        s_uart_ok++;
-    } else {
-        s_uart_fail++;
+    if (g_uart_tx_queue_id != 0) {
+        uart_tx_msg_t msg;
+        uint16_t copy_len = (rx_len > UART_TX_BUF_SIZE) ? UART_TX_BUF_SIZE : rx_len;
+        if (memcpy_s(msg.data, UART_TX_BUF_SIZE, buf, copy_len) == EOK) {
+            msg.len = copy_len;
+            if (osal_msg_queue_write_copy(g_uart_tx_queue_id, &msg,
+                                          sizeof(uart_tx_msg_t), 0) == OSAL_SUCCESS) {
+                s_uart_ok++;
+            } else {
+                s_uart_fail++;
+            }
+        }
     }
 
     /* 每100帧打印一次统计 */
     if ((s_uart_ok + s_uart_fail) % 100 == 0 && (s_uart_ok + s_uart_fail) > 0) {
-        osal_printk("[client] 统计: SLE收包=%lu 丢包=%lu UART转发成功=%lu 失败=%lu\r\n",
+        osal_printk("[client] 统计: SLE收包=%lu 丢包=%lu 入队成功=%lu 入队失败=%lu\r\n",
                     g_total_rx_pkts, g_lost_pkts, s_uart_ok, s_uart_fail);
     }
 }
@@ -415,7 +458,29 @@ void sle_start_scan()
 int sle_speed_init(void)
 {
     osal_msleep(5000);  /* sleep 5000ms，等待Server初始化完成 */
+
+    /* 创建UART发送队列 */
+    uint32_t ret = osal_msg_queue_create("uart_tx_q", UART_TX_QUEUE_LEN,
+                                         &g_uart_tx_queue_id, 0, sizeof(uart_tx_msg_t));
+    if (ret != OSAL_SUCCESS) {
+        osal_printk("[client] 队列创建失败 ret=%u\r\n", ret);
+        return -1;
+    }
+    osal_printk("[client] UART发送队列创建成功\r\n");
+
     client_uart1_init();
+
+    /* 启动UART发送线程 */
+    osal_task *tx_task = NULL;
+    osal_kthread_lock();
+    tx_task = osal_kthread_create((osal_kthread_handler)uart_tx_thread_function, 0,
+                                   "UartTxTask", 0x1000);
+    if (tx_task != NULL) {
+        osal_kthread_set_priority(tx_task, 25);
+        osal_kfree(tx_task);
+    }
+    osal_kthread_unlock();
+
     sle_client_init(sle_speed_notification_cb, sle_speed_indication_cb);
     return 0;
 }

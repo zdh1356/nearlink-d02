@@ -522,6 +522,14 @@ static void sle_connect_state_changed_cbk(uint16_t conn_id,
         }
     } else if (conn_state == SLE_ACB_STATE_DISCONNECTED) {
         g_send_thread_started = false;
+        /* 清空消息队列，避免重连后发送旧数据 */
+        if (g_uart_queue_id != 0) {
+            uart_msg_t tmp;
+            uint32_t tmp_size = sizeof(uart_msg_t);
+            while (osal_msg_queue_read_copy(g_uart_queue_id, &tmp, &tmp_size, 0) == OSAL_SUCCESS) {
+                tmp_size = sizeof(uart_msg_t);
+            }
+        }
         sle_start_announce(SLE_ADV_HANDLE_DEFAULT);
     }
 }
